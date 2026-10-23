@@ -375,10 +375,15 @@ jobs:
           资产名为 \`agent2api-providers-<version>-<target>.zip\`，网关的插件更新检查按这个名字找。
           每个包已用 ed25519 私钥签名（\`pack.json\` 的 \`signature\`），网关安装时逐字校验。"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.zip --clobber
+          # `-R` 必须显式给：本工作流 checkout 的是**源码仓库**，gh 会把检出
+          # 目录的 origin 当作当前仓库，于是 release 命令打到
+          # ProvidersPlugin/Agent2Providers 上 —— 那里的 GITHUB_TOKEN 没有写
+          # 权限（403 Resource not accessible by integration）。发版目标是
+          # **本仓库**，即运行时所在的 $GITHUB_REPOSITORY。
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" dist/*.zip \
+            gh release create "$TAG" dist/*.zip -R "$GITHUB_REPOSITORY" \
               --title "Agent2API providers $TAG" \
               --notes "$NOTES"
           fi

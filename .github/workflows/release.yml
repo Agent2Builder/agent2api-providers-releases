@@ -83,7 +83,24 @@ jobs:
         shell: bash
         env:
           SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
-        run: bash .ci/sign-packs.sh
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
@@ -131,7 +148,24 @@ jobs:
         shell: bash
         env:
           SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
-        run: bash .ci/sign-packs.sh
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
@@ -175,7 +209,24 @@ jobs:
         shell: bash
         env:
           SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
-        run: bash .ci/sign-packs.sh
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
@@ -243,7 +294,24 @@ jobs:
         shell: bash
         env:
           SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
-        run: bash .ci/sign-packs.sh
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::warning::没有 AGENT2API_PLUGIN_KEY，本次产物未签名"
+            exit 0
+          fi
+          KEY_FILE="$RUNNER_TEMP/plugin-signing-key.json"
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::dist/ 里没有 zip，打包步骤可能失败了"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            node scripts/sign.mjs sign --zip "$zip" --key "$KEY_FILE"
+          done
 
       - name: 上传产物
         uses: actions/upload-artifact@v7

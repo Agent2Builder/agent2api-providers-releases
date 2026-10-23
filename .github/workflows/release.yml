@@ -1,0 +1,316 @@
+name: Release
+
+# 提供商插件的构建与发布（在独立构建账号 `Agent2Builder` 下跑）。
+#
+# ── 为什么构建不在主仓库跑 ──────────────────────────────────
+# 插件是五平台矩阵（Windows + 两个 macOS + 两个 Linux），跑一次是实打实的
+# 重负载；而 tag 是发版动作、频率不可控。把「打一个版本标签」变成「自动兑换
+# 五次虚拟机开机」，最坏情况下会被判定为 Actions 滥用。所以主仓库
+# （ProvidersPlugin/Agent2Providers）推 tag 时只发一条极轻的
+# `repository_dispatch`，编译、验证、签名、发版全在这里的额度上跑。
+#
+# ── 源码从哪来 ──────────────────────────────────────────────
+# 主仓库是**公开仓库**，`actions/checkout` 指定 `repository` 直接拉即可，
+# 不需要 deploy key。将来主仓库转私有的话，把 `token:` 换成有 read 权限的
+# PAT（或配只读 deploy key）就行，其余步骤不用动。
+#
+# ── 产物发到哪 ──────────────────────────────────────────────
+# 本仓库自己的 Releases。网关的「检查更新」（`plugin_host::update`）按
+# `<id>-<version>-<target>.zip` 找资产，所以资产名必须与 `pack.json` 的版本号
+# 逐字一致 —— 改名等于让更新检查永远查不到（不报错，只是永远显示已是最新）。
+#
+# ── 触发方式 ────────────────────────────────────────────────
+#   · repository_dispatch（type=release）：主仓库推 `v*` tag 时派发过来，
+#     payload 带 `{ref, version}`
+#   · workflow_dispatch：手动补跑（可关掉发布，只上传 artifact）
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '主仓库的 git ref（tag 或分支）'
+        required: true
+        type: string
+      publish:
+        description: '发布为 Release（关闭则只上传 artifact）'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SOURCE_REPO: ProvidersPlugin/Agent2Providers
+  REF: ${{ github.event.client_payload.ref || github.event.inputs.ref }}
+
+jobs:
+  # ── Windows x64 ───────────────────────────────────────────
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      # 编译通过 ≠ 能运行：缺 DLL、清单不对、路径写错都只在启动时暴露。
+      # 这一步真的把二进制拉起来，走一遍协议握手，全绿才算过。
+      - name: 验证协议（真机启动）
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers.exe
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target x86_64-pc-windows-msvc
+
+      - name: 签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: bash .ci/sign-packs.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── macOS x64（Intel）─────────────────────────────────────
+  # macos-26-intel 是当前可用的 x86_64 标准 runner（macos-13 已于
+  # 2025-12-04 退役）。Apple 已停止支持 Intel，GitHub 也宣布 x86_64 macOS
+  # runner 会在 2027 年秋季彻底下线 —— 到那时若还要出 Intel 包，只能自建
+  # runner 或改出 universal 包。
+  macos-x64:
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      - name: 验证协议（真机启动）
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target x86_64-apple-darwin
+
+      - name: 签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: bash .ci/sign-packs.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-macos-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── macOS arm64（Apple Silicon）───────────────────────────
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      - name: 验证协议（真机启动）
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target aarch64-apple-darwin
+
+      - name: 签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: bash .ci/sign-packs.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-macos-arm64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── Linux x64 + arm64 ─────────────────────────────────────
+  # 每个架构在自己的原生 runner 上编、也在上面真跑一遍。不用 QEMU、不交叉：
+  # 交叉编译出来的 arm64 二进制在 x64 机器上跑不起来，那就没法做「真机启动
+  # 验证」—— 而编译通过不等于能运行（缺 so、权限、路径全在运行时才暴露）。
+  #
+  # ── 为什么用 ubuntu-22.04 而不是 ubuntu-latest ──────────────
+  # 插件跑在**用户机器上**，Linux 桌面端与 Docker 用户共用同一份 gnu 包。
+  # Docker 运行镜像是 `debian:bookworm-slim`（glibc 2.36）。22.04 的 glibc
+  # 是 2.35，比 bookworm 更低 —— glibc 向前兼容，所以 22.04 上编出来的包在
+  # bookworm 容器和更新的发行版上都能跑。反过来（在 24.04 上编，glibc 2.39）
+  # 装进容器会报 `GLIBC_2.39 not found`，现场只显示「插件启动失败」，很难查。
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: plugin-linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: plugin-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: 编译
+        run: cargo build --release -p agent2api-providers
+
+      - name: 验证协议（真机启动）
+        run: |
+          set -euo pipefail
+          BIN=target/release/agent2api-providers
+          chmod +x "$BIN"
+          node scripts/verify.mjs --exe "$BIN"
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target "${{ matrix.target }}"
+
+      - name: 签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: bash .ci/sign-packs.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ── 发布：五个平台的包汇成一个 Release ─────────────────────
+  publish:
+    needs: [windows-x64, macos-x64, macos-arm64, linux]
+    if: github.event_name == 'repository_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # 只为读 pack.json 的版本号 —— 资产名必须与包内声明的版本一致，
+      # 否则网关的更新检查按名字找不到资产（不报错，只是永远「已是最新」）。
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 解析版本号
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./pack.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 收集产物
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 核对平台数量
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*.zip)
+          echo "共 ${#files[@]} 个包："
+          printf '  %s\n' "${files[@]}"
+          # 五个平台各一份。少一个就有平台装不上 —— 网关装包时硬校验
+          # 「包里有没有当前平台的入口」（`plugin_host::install::entry_for_target`）。
+          [ ${#files[@]} -eq 5 ] || { echo "::error::期望 5 个平台包，实际 ${#files[@]} 个"; exit 1; }
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SOURCE_REF: ${{ env.REF }}
+          SOURCE_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          set -euo pipefail
+          NOTES="Provider plugin build $TAG.
+
+          源码：https://github.com/$SOURCE_REPO/tree/$SOURCE_REF
+
+          资产名为 \`agent2api-providers-<version>-<target>.zip\`，网关的插件更新检查按这个名字找。
+          每个包已用 ed25519 私钥签名（\`pack.json\` 的 \`signature\`），网关安装时逐字校验。"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber
+          else
+            gh release create "$TAG" dist/*.zip \
+              --title "Agent2API providers $TAG" \
+              --notes "$NOTES"
+          fi

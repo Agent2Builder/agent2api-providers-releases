@@ -340,8 +340,19 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./pack.json').version")
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::插件版本号不是合法的语义化版本: $VERSION"
+            exit 1
+          }
+          if [[ "$REF" == v* && "$REF" != "v$VERSION" ]]; then
+            echo "::error::tag $REF 与 pack.json 版本 $VERSION 不一致"
+            exit 1
+          fi
+          PRERELEASE=false
+          if [[ "${VERSION%%+*}" == *-* ]]; then PRERELEASE=true; fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
       - name: 收集产物
         uses: actions/download-artifact@v7
@@ -364,11 +375,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
           SOURCE_REF: ${{ env.REF }}
           SOURCE_REPO: ${{ env.SOURCE_REPO }}
         run: |
           set -euo pipefail
-          NOTES="Provider plugin build $TAG.
+          NOTES="$(git log -1 --format=%B)
 
           源码：https://github.com/$SOURCE_REPO/tree/$SOURCE_REF
 
@@ -382,8 +394,10 @@ jobs:
           # **本仓库**，即运行时所在的 $GITHUB_REPOSITORY。
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.zip -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease="$PRERELEASE" --notes "$NOTES" --title "提供商增强 $TAG"
           else
             gh release create "$TAG" dist/*.zip -R "$GITHUB_REPOSITORY" \
-              --title "Agent2API providers $TAG" \
+              --title "提供商增强 $TAG" \
+              --prerelease="$PRERELEASE" \
               --notes "$NOTES"
           fi

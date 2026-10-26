@@ -1,0 +1,188 @@
+name: Web Providers Release
+
+on:
+  repository_dispatch:
+    types: [web-release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Web 插件源码的 tag、分支或提交'
+        required: true
+        type: string
+      publish:
+        description: '发布 Release；关闭则仅保留工作流产物'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-providers-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SOURCE_REPO: ProvidersPlugin/Agent2WebProviders
+  REF: ${{ github.event.client_payload.ref || inputs.ref }}
+
+jobs:
+  build:
+    name: Web Providers · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          # Linux 包须兼容 Docker 的 Debian bookworm（glibc 2.36）。
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: web-providers-${{ matrix.target }}
+
+      - name: 编译
+        run: cargo build --release --locked -p agent2api-web-providers
+
+      - name: 打包
+        run: node scripts/pack.mjs --skip-build --target ${{ matrix.target }}
+
+      - name: 签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::error::缺少 AGENT2API_PLUGIN_KEY，拒绝产出未签名的官方插件"
+            exit 1
+          fi
+          KEY_FILE="$RUNNER_TEMP/web-plugin-signing-key.json"
+          umask 077
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          shopt -s nullglob
+          zips=(dist/agent2api-web-providers-*.zip)
+          [ ${#zips[@]} -eq 1 ] || {
+            echo "::error::期望一个 Web 插件包，实际 ${#zips[@]} 个"
+            exit 1
+          }
+          node scripts/sign.mjs sign --zip "${zips[0]}" --key "$KEY_FILE"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-plugin-${{ matrix.target }}
+          path: dist/agent2api-web-providers-*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'repository_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 解析发布版本
+        id: meta
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./pack.json').version")
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::pack.json 版本号不合法: $VERSION"
+            exit 1
+          }
+          if [[ "$REF" == v* && "$REF" != "v$VERSION" ]]; then
+            echo "::error::源码 tag $REF 与包版本 $VERSION 不一致"
+            exit 1
+          fi
+          if [ -n "$DISPATCH_VERSION" ] && [ "$DISPATCH_VERSION" != "$VERSION" ]; then
+            echo "::error::派发版本 $DISPATCH_VERSION 与包版本 $VERSION 不一致"
+            exit 1
+          fi
+          PRERELEASE=false
+          if [[ "${VERSION%%+*}" == *-* ]]; then PRERELEASE=true; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # 与同仓库提供商增强的 v* 发布标签隔离。
+          echo "tag=web-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: 收集 Web 插件产物
+        uses: actions/download-artifact@v7
+        with:
+          pattern: web-plugin-*
+          path: dist
+          merge-multiple: true
+
+      - name: 核对五个平台包
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/agent2api-web-providers-*.zip)
+          [ ${#files[@]} -eq 5 ] || {
+            echo "::error::期望 5 个 Web 插件包，实际 ${#files[@]} 个"
+            exit 1
+          }
+          for target in x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            [ -f "dist/agent2api-web-providers-$VERSION-$target.zip" ] || {
+              echo "::error::缺少 $target 的 Web 插件包"
+              exit 1
+            }
+          done
+
+      - name: 发布到插件构建仓库
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git log -1 --format=%B > "$RUNNER_TEMP/web-release-notes.md"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/agent2api-web-providers-*.zip -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease="$PRERELEASE" --latest=false \
+              --title "网页提供商 $TAG" --notes-file "$RUNNER_TEMP/web-release-notes.md"
+          else
+            gh release create "$TAG" dist/agent2api-web-providers-*.zip -R "$GITHUB_REPOSITORY" \
+              --prerelease="$PRERELEASE" --latest=false --title "网页提供商 $TAG" \
+              --notes-file "$RUNNER_TEMP/web-release-notes.md"
+          fi

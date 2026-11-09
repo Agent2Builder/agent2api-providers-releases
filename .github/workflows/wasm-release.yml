@@ -1,0 +1,255 @@
+name: WASM Providers Release
+
+on:
+  repository_dispatch:
+    types: [wasm-release]
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'wasm/ 下的提供商目录'
+        required: true
+        default: atomcode
+        type: string
+      ref:
+        description: '源码 tag、分支或提交；发布时必须指定独立 WASM tag'
+        required: true
+        type: string
+      publish:
+        description: '发布 Release；关闭则仅保留构建产物'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-release-${{ github.event.client_payload.provider || inputs.provider }}-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REPO: ProvidersPlugin/Agent2Providers
+  PROVIDER: ${{ github.event.client_payload.provider || inputs.provider }}
+  REF: ${{ github.event.client_payload.ref || inputs.ref }}
+
+jobs:
+  build:
+    name: 构建跨平台 WASM 插件
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      id: ${{ steps.meta.outputs.id }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      file: ${{ steps.meta.outputs.file }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.client_payload.sha || env.REF }}
+          persist-credentials: false
+
+      - name: 核对版本与源码提交
+        id: meta
+        shell: python
+        env:
+          PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          import json, os, pathlib, re, subprocess, tomllib
+          provider = os.environ['PROVIDER']
+          if not re.fullmatch(r'[a-z][a-z0-9-]*', provider):
+              raise ValueError('WASM 提供商目录无效')
+          folder = pathlib.Path('wasm') / provider
+          manifest = json.loads((folder / 'pack.json').read_text(encoding='utf-8'))
+          package = tomllib.loads((folder / 'Cargo.toml').read_text(encoding='utf-8'))['package']
+          version = manifest['version']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?', version):
+              raise ValueError('WASM 插件版本号无效')
+          plugin_id = f'agent2api-wasm-{provider}'
+          target = 'wasm32-unknown-unknown'
+          if manifest['id'] != plugin_id or package['name'] != plugin_id or package['version'] != version:
+              raise ValueError('包标识或版本与 Cargo.toml 不一致')
+          if manifest['protocol'] != 1 or list(manifest['entry']) != [target]:
+              raise ValueError('WASM 包必须使用协议 1 和唯一的跨平台入口')
+          if len(manifest['providers']) != 1 or manifest['providers'][0]['id'] != provider:
+              raise ValueError('WASM 包必须只声明当前提供商')
+          if not (folder / 'wasm.json').is_file():
+              raise ValueError('WASM 包缺少权限清单')
+          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          expected_sha = os.environ.get('DISPATCH_SHA', '')
+          if expected_sha and (not re.fullmatch(r'[0-9a-f]{40}', expected_sha) or expected_sha != revision):
+              raise ValueError('构建源码与派发时固定的提交不一致')
+          expected_version = os.environ.get('DISPATCH_VERSION', '')
+          if expected_version and expected_version != version:
+              raise ValueError('派发版本与包版本不一致')
+          tag = f'wasm-{provider}-v{version}'
+          if os.environ['PUBLISH'] == 'true':
+              if os.environ['REF'].removeprefix('refs/tags/') != tag:
+                  raise ValueError(f'发布必须使用源码 tag {tag}，不能发布分支快照')
+              subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', f'refs/tags/{tag}'], check=True)
+              tagged = subprocess.check_output(['git', 'rev-parse', 'FETCH_HEAD^{commit}'], text=True).strip()
+              if tagged != revision:
+                  raise ValueError('源码 tag 已移动，拒绝发布不同提交的产物')
+          values = {
+              'id': plugin_id, 'version': version, 'tag': tag,
+              'file': f'{plugin_id}-{version}-{target}.zip',
+              'prerelease': str('-' in version.split('+', 1)[0]).lower(),
+          }
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              for key, value in values.items():
+                  output.write(f'{key}={value}\n')
+          print(f'构建 {plugin_id} {version}，源码提交 {revision}')
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wasm -> target
+          key: wasm-${{ env.PROVIDER }}
+
+      - name: 编译并打包
+        run: node wasm/build.mjs "$PROVIDER"
+
+      - name: 签名并更新下载校验值
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+          FILE: ${{ steps.meta.outputs.file }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            printf '%s\n' '::error::缺少 AGENT2API_PLUGIN_KEY，拒绝产出未签名的发布包'
+            exit 1
+          fi
+          KEY_FILE="$RUNNER_TEMP/wasm-signing-key.json"
+          umask 077
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          node scripts/sign.mjs sign --zip "wasm/dist/$FILE" --key "$KEY_FILE" --target wasm32-unknown-unknown
+          (cd wasm/dist && sha256sum "$FILE" > "$FILE.sha256")
+          git log -1 --format=%B > wasm/dist/release-notes.md
+
+      - name: 保存已签名产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-plugin-${{ steps.meta.outputs.id }}
+          path: |
+            wasm/dist/${{ steps.meta.outputs.file }}
+            wasm/dist/${{ steps.meta.outputs.file }}.sha256
+            wasm/dist/release-notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: 发布独立 WASM 插件
+    needs: build
+    if: github.event_name == 'repository_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      PLUGIN_ID: ${{ needs.build.outputs.id }}
+      VERSION: ${{ needs.build.outputs.version }}
+      TAG: ${{ needs.build.outputs.tag }}
+      FILE: ${{ needs.build.outputs.file }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: wasm-plugin-${{ needs.build.outputs.id }}
+          path: dist
+
+      - name: 核对产物及包内清单
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, zipfile
+          folder = pathlib.Path('dist')
+          filename = os.environ['FILE']
+          if {path.name for path in folder.iterdir()} != {filename, f'{filename}.sha256', 'release-notes.md'}:
+              raise ValueError('发布产物不完整或包含不属于当前插件的文件')
+          package = folder / filename
+          digest = hashlib.sha256(package.read_bytes()).hexdigest()
+          if (folder / f'{filename}.sha256').read_text(encoding='utf-8') != f'{digest}  {filename}\n':
+              raise ValueError('插件包与签名后的下载校验值不一致')
+          with zipfile.ZipFile(package) as archive:
+              if len(archive.namelist()) != len(set(archive.namelist())) or archive.testzip() is not None:
+                  raise ValueError('插件包包含重复条目或损坏内容')
+              manifest = json.loads(archive.read('pack.json'))
+              target = 'wasm32-unknown-unknown'
+              if manifest['id'] != os.environ['PLUGIN_ID'] or manifest['version'] != os.environ['VERSION']:
+                  raise ValueError('下载文件名与包内版本或标识不一致')
+              if manifest['protocol'] != 1 or list(manifest['entry']) != [target]:
+                  raise ValueError('插件协议或跨平台入口不一致')
+              signature = manifest.get('signature', {})
+              if signature.get('algorithm') != 'ed25519' or signature.get('target') != target or not signature.get('keyId'):
+                  raise ValueError('WASM 包缺少正确的签名信息')
+              if len(base64.b64decode(signature['value'], validate=True)) != 64:
+                  raise ValueError('WASM 签名格式无效')
+              json.loads(archive.read('wasm.json'))
+              with archive.open(manifest['entry'][target]) as module:
+                  if module.read(8) != b'\0asm\x01\0\0\0':
+                      raise ValueError('插件入口不是有效的 WASM 模块')
+
+      - name: 发布完整附件且不覆盖原生最新版
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RELEASE="$RUNNER_TEMP/wasm-release.json"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,body,assets > "$RELEASE" 2> "$RUNNER_TEMP/wasm-release-error"; then
+            python - "$RELEASE" <<'PY'
+          import json, os, pathlib, sys
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+          if release['isPrerelease'] != (os.environ['PRERELEASE'] == 'true'):
+              raise ValueError('已有 Release 的正式版/预发布标记不一致，拒绝改写')
+          if not release['isDraft']:
+              expected = {os.environ['FILE'], os.environ['FILE'] + '.sha256'}
+              if {asset['name'] for asset in release['assets']} != expected:
+                  raise ValueError('已公开的同版本附件不一致，请使用新版本号')
+              notes = pathlib.Path('dist/release-notes.md').read_text(encoding='utf-8')
+              if release['body'].rstrip() != notes.rstrip():
+                  raise ValueError('已公开的同版本日志不一致，请使用新版本号')
+          PY
+            if [ "$(python -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["isDraft"]).lower())' "$RELEASE")" = false ]; then
+              EXISTING="$(mktemp -d)"
+              trap 'rm -rf "$EXISTING"' EXIT
+              gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir "$EXISTING" --pattern "$FILE" --pattern "$FILE.sha256"
+              if ! cmp -s "dist/$FILE" "$EXISTING/$FILE" || ! cmp -s "dist/$FILE.sha256" "$EXISTING/$FILE.sha256"; then
+                printf '%s\n' '::error::已公开的同版本包内容不同，拒绝覆盖，请使用新版本号'
+                exit 1
+              fi
+              printf '%s\n' '同一版本与附件已发布，无需重复上传'
+              exit 0
+            fi
+          else
+            if ! grep -qiE 'release not found|HTTP 404' "$RUNNER_TEMP/wasm-release-error"; then
+              python -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text())' "$RUNNER_TEMP/wasm-release-error"
+              exit 1
+            fi
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --latest=false --prerelease="$PRERELEASE" \
+              --title "WASM 插件 $TAG" --notes-file dist/release-notes.md
+          fi
+          for asset in "$FILE" "$FILE.sha256"; do
+            gh release upload "$TAG" "dist/$asset" -R "$GITHUB_REPOSITORY" --clobber
+          done
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets > "$RELEASE"
+          python - "$RELEASE" <<'PY'
+          import json, os, pathlib, sys
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+          if {asset['name'] for asset in release['assets']} != {os.environ['FILE'], os.environ['FILE'] + '.sha256'}:
+              raise ValueError('附件未齐或存在额外文件，Release 保持草稿')
+          PY
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest=false --prerelease="$PRERELEASE" \
+            --title "WASM 插件 $TAG" --notes-file dist/release-notes.md

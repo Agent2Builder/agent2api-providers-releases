@@ -380,12 +380,7 @@ jobs:
           SOURCE_REPO: ${{ env.SOURCE_REPO }}
         run: |
           set -euo pipefail
-          NOTES="$(git log -1 --format=%B)
-
-          源码：https://github.com/$SOURCE_REPO/tree/$SOURCE_REF
-
-          资产名为 \`agent2api-providers-<version>-<target>.zip\`，网关的插件更新检查按这个名字找。
-          每个包已用 ed25519 私钥签名（\`pack.json\` 的 \`signature\`），网关安装时逐字校验。"
+          NOTES="$(git log -1 --format=%B)"
 
           # `-R` 必须显式给：本工作流 checkout 的是**源码仓库**，gh 会把检出
           # 目录的 origin 当作当前仓库，于是 release 命令打到

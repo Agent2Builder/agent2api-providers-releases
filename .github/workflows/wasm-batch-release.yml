@@ -162,6 +162,7 @@ jobs:
         run: python3 .github/scripts/wasm_publish.py
 
   mirror:
+    if: vars.MIRROR_TO_SOURCE == 'true'
     name: 同步相同附件和日志到插件源码仓库
     needs: [build, publish]
     runs-on: ubuntu-latest

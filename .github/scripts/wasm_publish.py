@@ -21,12 +21,24 @@ def gh(*args, token=None, missing=False):
     env = dict(os.environ)
     if token:
         env['GH_TOKEN'] = token
-    result = subprocess.run(['gh', *args], capture_output=True, text=True, env=env, timeout=180)
-    if result.returncode:
+    for attempt in range(5):
+        try:
+            result = subprocess.run(['gh', *args], capture_output=True, text=True, env=env, timeout=180)
+        except subprocess.TimeoutExpired:
+            if attempt == 4:
+                raise RuntimeError('GitHub 请求超时，未确认完成')
+            time.sleep(min(2 ** (attempt + 1), 20))
+            continue
+        if not result.returncode:
+            return result.stdout
         if missing and ('HTTP 404' in result.stderr or 'release not found' in result.stderr.lower()):
             return None
-        raise RuntimeError(result.stderr.strip()[:1000])
-    return result.stdout
+        network = any(reason in result.stderr.lower() for reason in ['timeout', 'tls handshake', 'connection', 'eof',
+            'http 429', 'http 500', 'http 502', 'http 503', 'http 504'])
+        if not network or attempt == 4:
+            raise RuntimeError(result.stderr.strip()[:1000])
+        time.sleep(min(2 ** (attempt + 1), 20))
+    raise RuntimeError('GitHub 请求未完成')
 
 
 def api(path, token=None):
@@ -68,7 +80,14 @@ def publish_release(repository, tag, notes, files, prerelease, token=None):
     else:
         gh('release', 'create', tag, '-R', repository, '--draft', '--latest=false', f'--prerelease={flag}',
             '--title', tag, '--notes-file', str(notes), token=token)
+        release = find_release(repository, tag, token)
+    if not release:
+        raise ValueError('Release 草稿无法读取，停止上传')
     for file in files:
+        current = next((asset for asset in release['assets'] if asset['name'] == file.name), None)
+        digest = 'sha256:' + hashlib.sha256(file.read_bytes()).hexdigest()
+        if current and current.get('digest') == digest and current['size'] == file.stat().st_size:
+            continue
         gh('release', 'upload', tag, str(file), '-R', repository, '--clobber', token=token)
     release = find_release(repository, tag, token)
     if not release:

@@ -1,0 +1,80 @@
+name: Publish WASM Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '原始独立 WASM 批量构建编号'
+        required: true
+        type: string
+      artifact:
+        description: '原始 run 保存的完整发布产物名称'
+        required: true
+        type: string
+      only:
+        description: '只重做失败的发布步骤，不重新编译'
+        required: true
+        type: choice
+        options: [all, publish, website, mirror]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-artifacts-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 核对原始构建来源
+        shell: python
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          import json, os, re, subprocess
+          run_id = os.environ['RUN_ID']
+          if not re.fullmatch(r'[1-9]\d{0,19}', run_id) or not re.fullmatch(r'wasm-(?:agent|web)-[0-9A-Za-z.+-]+', os.environ['ARTIFACT']):
+              raise ValueError('构建编号或产物名称无效')
+          run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run_id}']))
+          if run['path'] != '.github/workflows/wasm-batch-release.yml' or run['event'] not in ['repository_dispatch', 'workflow_dispatch'] or run['status'] != 'completed':
+              raise ValueError('仅允许使用已完成的官方独立 WASM 批量构建')
+          jobs = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run_id}/jobs?per_page=100']))['jobs']
+          if not any(job['name'] == '批量构建独立 WASM 插件' and job['conclusion'] == 'success' for job in jobs):
+              raise ValueError('原始批量构建未成功，不允许发布不完整产物')
+
+      - uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ inputs.artifact }}
+          path: dist
+
+      - run: python3 -m pip install --disable-pip-version-check cryptography
+
+      - name: 发布与官网收尾
+        if: inputs.only != 'mirror'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_PUBLISH_SECRET: ${{ secrets.PLUGIN_PUBLISH_SECRET }}
+          RUN_ID: ${{ inputs.run_id }}
+          ONLY: ${{ inputs.only }}
+        run: python3 .github/scripts/wasm_publish.py --only "$ONLY"
+
+      - name: 同步源码 Release
+        if: inputs.only == 'mirror' || inputs.only == 'all'
+        env:
+          SOURCE_RELEASE_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN }}
+        run: python3 .github/scripts/wasm_publish.py --only mirror

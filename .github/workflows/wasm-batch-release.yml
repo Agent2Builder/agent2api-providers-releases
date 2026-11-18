@@ -1,0 +1,187 @@
+name: WASM Batch Release
+
+on:
+  repository_dispatch:
+    types: [wasm-batch-release]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: '独立插件源码仓库'
+        required: true
+        type: choice
+        options: [ProvidersPlugin/Agent2Providers, ProvidersPlugin/Agent2WebProviders]
+      ref:
+        description: '已经确认的仓库版本 tag'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-batch-${{ github.event.client_payload.repository || inputs.repository }}-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ${{ github.event.client_payload.repository || inputs.repository }}
+  REF: ${{ github.event.client_payload.ref || inputs.ref }}
+  SOURCE_SHA: ${{ github.event.client_payload.sha }}
+  SDK_REF: ${{ github.event.client_payload.sdk_ref }}
+  SDK_SHA: ${{ github.event.client_payload.sdk_sha }}
+
+jobs:
+  build:
+    name: 批量构建独立 WASM 插件
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      artifact: ${{ steps.meta.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 核对派发来源
+        shell: python
+        run: |
+          import os, re
+          if os.environ['SOURCE_REPO'] not in ['ProvidersPlugin/Agent2Providers', 'ProvidersPlugin/Agent2WebProviders']:
+              raise ValueError('不允许此源码仓库')
+          if not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', os.environ['REF']):
+              raise ValueError('发布必须使用完整仓库 tag')
+          sha = os.environ['SOURCE_SHA']
+          if sha and not re.fullmatch(r'[0-9a-f]{40}', sha):
+              raise ValueError('派发源码提交无效')
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_SHA || env.REF }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: env.SOURCE_REPO == 'ProvidersPlugin/Agent2WebProviders'
+        with:
+          repository: ProvidersPlugin/Agent2Providers
+          ref: ${{ env.SDK_SHA || env.SDK_REF || env.REF }}
+          path: Agent2Providers
+          persist-credentials: false
+
+      - name: 安装签名核对工具
+        run: python3 -m pip install --disable-pip-version-check cryptography
+
+      - name: 固定源码与独立包清单
+        id: meta
+        run: python3 .github/scripts/wasm_batch.py prepare
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source/wasm -> target
+          key: wasm-batch-${{ steps.meta.outputs.category }}
+
+      - name: 编译独立 WASM 包
+        run: cargo build --manifest-path source/wasm/Cargo.toml --workspace --target wasm32-unknown-unknown --release --locked
+
+      - name: 打包并签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEY" || { printf '%s\n' '::error::官方插件签名未配置'; exit 1; }
+          KEY_FILE="$RUNNER_TEMP/wasm-signing-key.json"
+          umask 077
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          export SIGNING_KEY_FILE="$KEY_FILE"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          index = json.loads(pathlib.Path('release-index.json').read_text())
+          source = pathlib.Path('source')
+          signer = source / 'scripts/sign.mjs' if index['repository'].endswith('/Agent2Providers') else pathlib.Path('Agent2Providers/scripts/sign.mjs')
+          for package in index['packages']:
+              subprocess.run(['node', str(source / 'wasm/build.mjs'), package['provider']], check=True)
+              file = source / 'wasm/dist' / package['file']
+              subprocess.run(['node', str(signer), 'sign', '--zip', str(file), '--key', os.environ['SIGNING_KEY_FILE'], '--target', 'wasm32-unknown-unknown'], check=True)
+              digest = hashlib.sha256(file.read_bytes()).hexdigest()
+              pathlib.Path(str(file) + '.sha256').write_text(f'{digest}  {file.name}\n')
+          pathlib.Path('source/wasm/dist/release-index.json').write_text(pathlib.Path('release-index.json').read_text())
+          notes = subprocess.check_output(['git', '-C', 'source', 'log', '-1', '--format=%B'], text=True)
+          pathlib.Path('source/wasm/dist/release-notes.md').write_text(notes, encoding='utf-8')
+          PY
+
+      - name: 核对全部官方签名及发布清单
+        run: python3 .github/scripts/wasm_batch.py verify --directory source/wasm/dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: source/wasm/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 保存发布来源
+        shell: bash
+        run: |
+          printf '### 独立 WASM 发布\n\n源码：%s `%s`\n\n产物：`%s`\n' "$SOURCE_REPO" "$REF" '${{ steps.meta.outputs.artifact }}' >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: 发布并上传官网存储
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+
+      - run: python3 -m pip install --disable-pip-version-check cryptography
+
+      - name: 发布独立包并通知官网完成校验
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_PUBLISH_SECRET: ${{ secrets.PLUGIN_PUBLISH_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+        run: python3 .github/scripts/wasm_publish.py
+
+  mirror:
+    name: 同步相同附件和日志到插件源码仓库
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+
+      - run: python3 -m pip install --disable-pip-version-check cryptography
+
+      - name: 同步插件源码 Release
+        env:
+          SOURCE_RELEASE_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN }}
+        run: python3 .github/scripts/wasm_publish.py --only mirror

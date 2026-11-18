@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from wasm_batch import verify
@@ -33,11 +33,24 @@ def api(path, token=None):
     return json.loads(gh('api', path, token=token))
 
 
+def find_release(repository, tag, token=None):
+    published = gh('api', f'repos/{repository}/releases/tags/{quote(tag, safe="")}', token=token, missing=True)
+    if published:
+        return json.loads(published)
+    for page in range(1, 11):
+        releases = api(f'repos/{repository}/releases?per_page=100&page={page}', token)
+        for release in releases:
+            if release['tag_name'] == tag:
+                return release
+        if len(releases) < 100:
+            break
+    return None
+
+
 def publish_release(repository, tag, notes, files, prerelease, token=None):
-    existing = gh('api', f'repos/{repository}/releases/tags/{quote(tag, safe="")}', token=token, missing=True)
+    release = find_release(repository, tag, token)
     flag = str(prerelease).lower()
-    if existing:
-        release = json.loads(existing)
+    if release:
         if release['prerelease'] != prerelease:
             raise ValueError('已有 Release 的预发布标记不一致，拒绝修改')
         if not release['draft']:
@@ -57,7 +70,9 @@ def publish_release(repository, tag, notes, files, prerelease, token=None):
             '--title', tag, '--notes-file', str(notes), token=token)
     for file in files:
         gh('release', 'upload', tag, str(file), '-R', repository, '--clobber', token=token)
-    release = api(f'repos/{repository}/releases/tags/{quote(tag, safe="")}', token)
+    release = find_release(repository, tag, token)
+    if not release:
+        raise ValueError('Release 草稿无法读取，停止公开')
     if {asset['name'] for asset in release['assets']} != {file.name for file in files}:
         raise ValueError('Release 附件尚未齐全，保留草稿')
     for file in files:

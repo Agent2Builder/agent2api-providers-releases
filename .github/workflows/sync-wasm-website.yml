@@ -1,0 +1,30 @@
+name: Sync WASM Releases To Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: '要登记到官网和 R2 的已发布 tag（空格或逗号分隔）'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: 登记已有 WASM 发布到官网存储
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_PUBLISH_SECRET: ${{ secrets.PLUGIN_PUBLISH_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          TAGS: ${{ inputs.tags }}
+        run: python3 .github/scripts/wasm_publish.py --register-tags "$TAGS"

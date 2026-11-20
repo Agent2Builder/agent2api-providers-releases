@@ -253,3 +253,17 @@ jobs:
           PY
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest=false --prerelease="$PRERELEASE" \
             --title "WASM 插件 $TAG" --notes-file dist/release-notes.md
+
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          path: builder
+          persist-credentials: false
+
+      - name: 登记到官网与 R2 存储
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_PUBLISH_SECRET: ${{ secrets.PLUGIN_PUBLISH_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: python3 builder/.github/scripts/wasm_publish.py --register-tags "$TAG"

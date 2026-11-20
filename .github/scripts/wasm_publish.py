@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -171,9 +172,27 @@ def publish(folder, only):
         publish_release(index['repository'], source_tag, notes, files, prerelease, token)
 
 
+def register_tags(raw_tags, run_id):
+    tags = [tag for tag in re.split(r'[\s,]+', raw_tags.strip()) if tag]
+    if not tags:
+        raise ValueError('至少提供一个要登记的插件发布 tag')
+    for tag in tags:
+        match = re.fullmatch(r'wasm-([a-z][a-z0-9-]*)-v(.+)', tag)
+        if not match:
+            raise ValueError(f'插件发布 tag 格式无效：{tag}')
+        provider, version = match.groups()
+        package = {'id': f'agent2api-wasm-{provider}', 'version': version, 'tag': tag}
+        release = api(f"repos/{BUILD_REPO}/releases/tags/{quote(tag, safe='')}")
+        notify(package, release, run_id)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--directory', type=Path, default=Path('dist'))
     parser.add_argument('--only', choices=['all', 'publish', 'website', 'mirror'], default='all')
+    parser.add_argument('--register-tags', default='')
     args = parser.parse_args()
-    publish(args.directory, args.only)
+    if args.register_tags:
+        register_tags(args.register_tags, os.environ['RUN_ID'])
+    else:
+        publish(args.directory, args.only)

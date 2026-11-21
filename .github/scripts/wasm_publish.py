@@ -18,7 +18,7 @@ BUILD_REPO = 'Agent2Builder/agent2api-providers-releases'
 ENDPOINT = 'https://oyl.agent2api.dev/api/ci/plugins'
 
 
-def gh(*args, token=None, missing=False):
+def gh(*args, token=None, missing=False, retry_not_found=False):
     env = dict(os.environ)
     if token:
         env['GH_TOKEN'] = token
@@ -32,18 +32,19 @@ def gh(*args, token=None, missing=False):
             continue
         if not result.returncode:
             return result.stdout
-        if missing and ('HTTP 404' in result.stderr or 'release not found' in result.stderr.lower()):
+        not_found = 'HTTP 404' in result.stderr or 'release not found' in result.stderr.lower()
+        if missing and not_found:
             return None
         network = any(reason in result.stderr.lower() for reason in ['timeout', 'tls handshake', 'connection', 'eof',
-            'http 429', 'http 500', 'http 502', 'http 503', 'http 504'])
+            'http 429', 'http 500', 'http 502', 'http 503', 'http 504']) or (retry_not_found and not_found)
         if not network or attempt == 4:
             raise RuntimeError(result.stderr.strip()[:1000])
         time.sleep(min(2 ** (attempt + 1), 20))
     raise RuntimeError('GitHub 请求未完成')
 
 
-def api(path, token=None):
-    return json.loads(gh('api', path, token=token))
+def api(path, token=None, retry_not_found=False):
+    return json.loads(gh('api', path, token=token, retry_not_found=retry_not_found))
 
 
 def find_release(repository, tag, token=None):
@@ -57,6 +58,17 @@ def find_release(repository, tag, token=None):
                 return release
         if len(releases) < 100:
             break
+    return None
+
+
+def wait_release(repository, tag, release_id=None, token=None):
+    if release_id is not None:
+        return api(f'repos/{repository}/releases/{release_id}', token=token, retry_not_found=True)
+    for delay in (1, 2, 3, 5, 8):
+        time.sleep(delay)
+        release = find_release(repository, tag, token)
+        if release:
+            return release
     return None
 
 
@@ -81,7 +93,7 @@ def publish_release(repository, tag, notes, files, prerelease, token=None):
     else:
         gh('release', 'create', tag, '-R', repository, '--draft', '--latest=false', f'--prerelease={flag}',
             '--title', tag, '--notes-file', str(notes), token=token)
-        release = find_release(repository, tag, token)
+        release = wait_release(repository, tag, token=token)
     if not release:
         raise ValueError('Release 草稿无法读取，停止上传')
     for file in files:
@@ -89,8 +101,8 @@ def publish_release(repository, tag, notes, files, prerelease, token=None):
         digest = 'sha256:' + hashlib.sha256(file.read_bytes()).hexdigest()
         if current and current.get('digest') == digest and current['size'] == file.stat().st_size:
             continue
-        gh('release', 'upload', tag, str(file), '-R', repository, '--clobber', token=token)
-    release = find_release(repository, tag, token)
+        gh('release', 'upload', tag, str(file), '-R', repository, '--clobber', token=token, retry_not_found=True)
+    release = wait_release(repository, tag, release_id=release.get('id'), token=token) or find_release(repository, tag, token)
     if not release:
         raise ValueError('Release 草稿无法读取，停止公开')
     if {asset['name'] for asset in release['assets']} != {file.name for file in files}:
@@ -100,9 +112,9 @@ def publish_release(repository, tag, notes, files, prerelease, token=None):
         if asset.get('digest') != 'sha256:' + hashlib.sha256(file.read_bytes()).hexdigest():
             raise ValueError('GitHub 附件完整校验值不一致，保留草稿')
     gh('release', 'edit', tag, '-R', repository, '--draft=false', '--latest=false', f'--prerelease={flag}',
-        '--title', tag, '--notes-file', str(notes), token=token)
+        '--title', tag, '--notes-file', str(notes), token=token, retry_not_found=True)
     print(f'已发布 {repository} {tag}，附件 {len(files)} 个', flush=True)
-    return api(f'repos/{repository}/releases/tags/{quote(tag, safe="")}', token)
+    return api(f'repos/{repository}/releases/tags/{quote(tag, safe="")}', token=token, retry_not_found=True)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -159,7 +171,7 @@ def publish(folder, only):
                 [folder / package['file'], folder / (package['file'] + '.sha256')], '-' in package['version'].split('+', 1)[0])
     if only in ('all', 'website'):
         for package in index['packages']:
-            release = api(f"repos/{BUILD_REPO}/releases/tags/{quote(package['tag'], safe='')}")
+            release = api(f"repos/{BUILD_REPO}/releases/tags/{quote(package['tag'], safe='')}", retry_not_found=True)
             notify(package, release, os.environ['RUN_ID'])
     if only == 'mirror':
         token = os.environ.get('SOURCE_RELEASE_TOKEN', '')

@@ -5,6 +5,12 @@ on:
     types: [wasm-release]
   workflow_dispatch:
     inputs:
+      repository:
+        description: '独立插件源码仓库'
+        required: false
+        default: ProvidersPlugin/Agent2Providers
+        type: choice
+        options: [ProvidersPlugin/Agent2Providers, ProvidersPlugin/Agent2WebProviders]
       provider:
         description: 'wasm/ 下的提供商目录'
         required: true
@@ -24,14 +30,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: wasm-release-${{ github.event.client_payload.provider || inputs.provider }}-${{ github.event.client_payload.ref || inputs.ref }}
+  group: wasm-release-${{ github.event.client_payload.repository || inputs.repository || 'ProvidersPlugin/Agent2Providers' }}-${{ github.event.client_payload.provider || inputs.provider }}-${{ github.event.client_payload.ref || inputs.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  SOURCE_REPO: ProvidersPlugin/Agent2Providers
+  SOURCE_REPO: ${{ github.event.client_payload.repository || inputs.repository || 'ProvidersPlugin/Agent2Providers' }}
   PROVIDER: ${{ github.event.client_payload.provider || inputs.provider }}
   REF: ${{ github.event.client_payload.ref || inputs.ref }}
+  SDK_REF: ${{ github.event.client_payload.sdk_ref }}
+  SDK_SHA: ${{ github.event.client_payload.sdk_sha }}
 
 jobs:
   build:
@@ -42,13 +50,30 @@ jobs:
       id: ${{ steps.meta.outputs.id }}
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
+      category: ${{ steps.meta.outputs.category }}
       file: ${{ steps.meta.outputs.file }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
+      - name: 核对源码仓库
+        shell: python
+        run: |
+          import os
+          if os.environ['SOURCE_REPO'] not in ('ProvidersPlugin/Agent2Providers', 'ProvidersPlugin/Agent2WebProviders'):
+              raise ValueError('不允许此源码仓库')
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ github.event.client_payload.sha || env.REF }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: env.SOURCE_REPO == 'ProvidersPlugin/Agent2WebProviders'
+        with:
+          repository: ProvidersPlugin/Agent2Providers
+          ref: ${{ env.SDK_SHA || env.SDK_REF || 'beta' }}
+          path: Agent2Providers
           persist-credentials: false
 
       - name: 核对版本与源码提交
@@ -60,10 +85,13 @@ jobs:
           DISPATCH_VERSION: ${{ github.event.client_payload.version }}
         run: |
           import json, os, pathlib, re, subprocess, tomllib
+          source_repo = os.environ['SOURCE_REPO']
+          is_web = source_repo == 'ProvidersPlugin/Agent2WebProviders'
           provider = os.environ['PROVIDER']
           if not re.fullmatch(r'[a-z][a-z0-9-]*', provider):
               raise ValueError('WASM 提供商目录无效')
-          folder = pathlib.Path('wasm') / provider
+          source_dir = pathlib.Path('source')
+          folder = source_dir / 'wasm' / provider
           manifest = json.loads((folder / 'pack.json').read_text(encoding='utf-8'))
           package = tomllib.loads((folder / 'Cargo.toml').read_text(encoding='utf-8'))['package']
           version = manifest['version']
@@ -77,9 +105,11 @@ jobs:
               raise ValueError('WASM 包必须使用协议 1 和唯一的跨平台入口')
           if len(manifest['providers']) != 1 or manifest['providers'][0]['id'] != provider:
               raise ValueError('WASM 包必须只声明当前提供商')
+          if (manifest.get('provider_category', 'agent') == 'web') != is_web:
+              raise ValueError('插件分类与源码仓库不一致')
           if not (folder / 'wasm.json').is_file():
               raise ValueError('WASM 包缺少权限清单')
-          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          revision = subprocess.check_output(['git', '-C', 'source', 'rev-parse', 'HEAD'], text=True).strip()
           expected_sha = os.environ.get('DISPATCH_SHA', '')
           if expected_sha and (not re.fullmatch(r'[0-9a-f]{40}', expected_sha) or expected_sha != revision):
               raise ValueError('构建源码与派发时固定的提交不一致')
@@ -90,19 +120,20 @@ jobs:
           if os.environ['PUBLISH'] == 'true':
               if os.environ['REF'].removeprefix('refs/tags/') != tag:
                   raise ValueError(f'发布必须使用源码 tag {tag}，不能发布分支快照')
-              subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', f'refs/tags/{tag}'], check=True)
-              tagged = subprocess.check_output(['git', 'rev-parse', 'FETCH_HEAD^{commit}'], text=True).strip()
+              subprocess.run(['git', '-C', 'source', 'fetch', '--no-tags', '--depth=1', 'origin', f'refs/tags/{tag}'], check=True)
+              tagged = subprocess.check_output(['git', '-C', 'source', 'rev-parse', 'FETCH_HEAD^{commit}'], text=True).strip()
               if tagged != revision:
                   raise ValueError('源码 tag 已移动，拒绝发布不同提交的产物')
           values = {
               'id': plugin_id, 'version': version, 'tag': tag,
+              'category': 'web' if is_web else 'agent',
               'file': f'{plugin_id}-{version}-{target}.zip',
               'prerelease': str('-' in version.split('+', 1)[0]).lower(),
           }
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for key, value in values.items():
                   output.write(f'{key}={value}\n')
-          print(f'构建 {plugin_id} {version}，源码提交 {revision}')
+          print(f'构建 {source_repo} {plugin_id} {version}，源码提交 {revision}')
 
       - uses: actions/setup-node@v7
         with:
@@ -114,11 +145,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: wasm -> target
-          key: wasm-${{ env.PROVIDER }}
+          workspaces: source/wasm -> target
+          key: wasm-${{ steps.meta.outputs.category }}-${{ env.PROVIDER }}
 
       - name: 编译并打包
-        run: node wasm/build.mjs "$PROVIDER"
+        run: node source/wasm/build.mjs "$PROVIDER"
 
       - name: 签名并更新下载校验值
         shell: bash
@@ -135,18 +166,22 @@ jobs:
           umask 077
           printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
           trap 'rm -f "$KEY_FILE"' EXIT
-          node scripts/sign.mjs sign --zip "wasm/dist/$FILE" --key "$KEY_FILE" --target wasm32-unknown-unknown
-          (cd wasm/dist && sha256sum "$FILE" > "$FILE.sha256")
-          git log -1 --format=%B > wasm/dist/release-notes.md
+          SIGNER="source/scripts/sign.mjs"
+          if [ "$SOURCE_REPO" = "ProvidersPlugin/Agent2WebProviders" ]; then
+            SIGNER="Agent2Providers/scripts/sign.mjs"
+          fi
+          node "$SIGNER" sign --zip "source/wasm/dist/$FILE" --key "$KEY_FILE" --target wasm32-unknown-unknown
+          (cd source/wasm/dist && sha256sum "$FILE" > "$FILE.sha256")
+          git -C source log -1 --format=%B > source/wasm/dist/release-notes.md
 
       - name: 保存已签名产物
         uses: actions/upload-artifact@v7
         with:
           name: wasm-plugin-${{ steps.meta.outputs.id }}
           path: |
-            wasm/dist/${{ steps.meta.outputs.file }}
-            wasm/dist/${{ steps.meta.outputs.file }}.sha256
-            wasm/dist/release-notes.md
+            source/wasm/dist/${{ steps.meta.outputs.file }}
+            source/wasm/dist/${{ steps.meta.outputs.file }}.sha256
+            source/wasm/dist/release-notes.md
           if-no-files-found: error
           retention-days: 14
 

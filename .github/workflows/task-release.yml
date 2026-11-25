@@ -1,0 +1,261 @@
+name: Task Plugins Release
+
+on:
+  repository_dispatch:
+    types: [task-release]
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: 'plugins/ 下的定时任务插件目录'
+        required: true
+        default: newapi-login-checkin
+        type: string
+      ref:
+        description: '源码 tag、分支或提交；发布时必须指定独立 task-<plugin>-v<version> tag'
+        required: true
+        type: string
+      publish:
+        description: '发布 Release；关闭则仅保留构建产物'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: task-release-${{ github.event.client_payload.plugin || inputs.plugin }}-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ProvidersPlugin/Agent2TaskPlugins
+  PLUGIN: ${{ github.event.client_payload.plugin || inputs.plugin }}
+  REF: ${{ github.event.client_payload.ref || inputs.ref }}
+
+jobs:
+  build:
+    name: 构建并签名定时任务插件
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      id: ${{ steps.meta.outputs.id }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      file: ${{ steps.meta.outputs.file }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.client_payload.sha || env.REF }}
+          persist-credentials: false
+
+      - name: 核对版本与源码提交
+        id: meta
+        shell: python
+        env:
+          PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          import json, os, pathlib, re, subprocess
+          plugin = os.environ['PLUGIN']
+          if not re.fullmatch(r'[a-z][a-z0-9-]*', plugin):
+              raise ValueError('定时任务插件目录无效')
+          folder = pathlib.Path('plugins') / plugin
+          manifest = json.loads((folder / 'pack.json').read_text(encoding='utf-8'))
+          script_text = (folder / 'script.js').read_text(encoding='utf-8')
+          match = re.search(r'/\*\s*@agent2api-task-plugin\s*([\s\S]*?)\*/', script_text)
+          if not match:
+              raise ValueError('script.js 缺少 @agent2api-task-plugin 头部声明块')
+          meta = json.loads(match.group(1))
+          version = manifest['version']
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?', version):
+              raise ValueError('定时任务插件版本号无效')
+          plugin_id = f'agent2api-task-{plugin}'
+          target = 'task-script'
+          if manifest.get('id') != plugin_id or meta.get('id') != plugin_id or meta.get('version') != version:
+              raise ValueError('包标识或版本与 script.js 声明不一致')
+          if manifest.get('category') != 'scheduled_task' or manifest.get('target') != target or manifest.get('entry') != 'script.js':
+              raise ValueError('定时任务插件 pack.json 必须声明 category=scheduled_task, target=task-script, entry=script.js')
+          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          expected_sha = os.environ.get('DISPATCH_SHA', '')
+          if expected_sha and (not re.fullmatch(r'[0-9a-f]{40}', expected_sha) or expected_sha != revision):
+              raise ValueError('构建源码与派发时固定的提交不一致')
+          expected_version = os.environ.get('DISPATCH_VERSION', '')
+          if expected_version and expected_version != version:
+              raise ValueError('派发版本与包版本不一致')
+          tag = f'task-{plugin}-v{version}'
+          if os.environ['PUBLISH'] == 'true':
+              if os.environ['REF'].removeprefix('refs/tags/') != tag:
+                  raise ValueError(f'发布必须使用源码 tag {tag}，不能发布分支快照')
+              subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', f'refs/tags/{tag}'], check=True)
+              tagged = subprocess.check_output(['git', 'rev-parse', 'FETCH_HEAD^{commit}'], text=True).strip()
+              if tagged != revision:
+                  raise ValueError('源码 tag 已移动，拒绝发布不同提交的产物')
+          values = {
+              'id': plugin_id, 'version': version, 'tag': tag,
+              'file': f'{plugin_id}-{version}-{target}.zip',
+              'prerelease': str('-' in version.split('+', 1)[0]).lower(),
+          }
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              for key, value in values.items():
+                  output.write(f'{key}={value}\n')
+          print(f'构建 {plugin_id} {version}，源码提交 {revision}')
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 校验打包并写入官方签名
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+          FILE: ${{ steps.meta.outputs.file }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            printf '%s\n' '::error::缺少 AGENT2API_PLUGIN_KEY，拒绝产出未签名的发布包'
+            exit 1
+          fi
+          KEY_FILE="$RUNNER_TEMP/task-signing-key.json"
+          umask 077
+          printf '%s' "$SIGNING_KEY" > "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          node scripts/pack.mjs "$PLUGIN" --key "$KEY_FILE" --require-signature
+          test -f "dist/$FILE"
+          test -f "dist/$FILE.sha256"
+          git log -1 --format=%B > dist/release-notes.md
+
+      - name: 保存已签名产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: task-plugin-${{ steps.meta.outputs.id }}
+          path: |
+            dist/${{ steps.meta.outputs.file }}
+            dist/${{ steps.meta.outputs.file }}.sha256
+            dist/release-notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: 发布定时任务插件
+    needs: build
+    if: github.event_name == 'repository_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      PLUGIN_ID: ${{ needs.build.outputs.id }}
+      VERSION: ${{ needs.build.outputs.version }}
+      TAG: ${{ needs.build.outputs.tag }}
+      FILE: ${{ needs.build.outputs.file }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: task-plugin-${{ needs.build.outputs.id }}
+          path: dist
+
+      - name: 核对产物及包内清单
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, re, zipfile
+          folder = pathlib.Path('dist')
+          filename = os.environ['FILE']
+          if {path.name for path in folder.iterdir()} != {filename, f'{filename}.sha256', 'release-notes.md'}:
+              raise ValueError('发布产物不完整或包含不属于当前插件的文件')
+          package = folder / filename
+          if package.stat().st_size > 2 * 1024 * 1024:
+              raise ValueError('定时任务插件包体积超过 2 MiB 上限')
+          digest = hashlib.sha256(package.read_bytes()).hexdigest()
+          if (folder / f'{filename}.sha256').read_text(encoding='utf-8') != f'{digest}  {filename}\n':
+              raise ValueError('插件包与签名后的下载校验值不一致')
+          with zipfile.ZipFile(package) as archive:
+              if len(archive.namelist()) != len(set(archive.namelist())) or archive.testzip() is not None:
+                  raise ValueError('插件包包含重复条目或损坏内容')
+              manifest = json.loads(archive.read('pack.json'))
+              if manifest.get('id') != os.environ['PLUGIN_ID'] or manifest.get('version') != os.environ['VERSION']:
+                  raise ValueError('下载文件名与包内版本或标识不一致')
+              if manifest.get('category') != 'scheduled_task' or manifest.get('target') != 'task-script' or manifest.get('entry') != 'script.js':
+                  raise ValueError('插件包类型或入口声明不一致')
+              signature = manifest.get('signature', {})
+              if signature.get('algorithm') != 'ed25519' or not signature.get('key_id'):
+                  raise ValueError('定时任务插件包缺少正确的签名信息')
+              if len(base64.b64decode(signature['value'], validate=True)) != 64:
+                  raise ValueError('定时任务插件签名格式无效')
+              script_text = archive.read('script.js').decode('utf-8')
+              match = re.search(r'/\*\s*@agent2api-task-plugin\s*([\s\S]*?)\*/', script_text)
+              if not match:
+                  raise ValueError('ZIP 内 script.js 缺少头部声明块')
+              meta = json.loads(match.group(1))
+              if meta.get('id') != os.environ['PLUGIN_ID'] or meta.get('version') != os.environ['VERSION']:
+                  raise ValueError('ZIP 内 script.js 声明与 pack.json 不一致')
+
+      - name: 发布完整附件且不覆盖原生最新版
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RELEASE="$RUNNER_TEMP/task-release.json"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,body,assets > "$RELEASE" 2> "$RUNNER_TEMP/task-release-error"; then
+            python - "$RELEASE" <<'PY'
+          import json, os, pathlib, sys
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+          if release['isPrerelease'] != (os.environ['PRERELEASE'] == 'true'):
+              raise ValueError('已有 Release 的正式版/预发布标记不一致，拒绝改写')
+          if not release['isDraft']:
+              expected = {os.environ['FILE'], os.environ['FILE'] + '.sha256'}
+              if {asset['name'] for asset in release['assets']} != expected:
+                  raise ValueError('已公开的同版本附件不一致，请使用新版本号')
+              notes = pathlib.Path('dist/release-notes.md').read_text(encoding='utf-8')
+              if release['body'].rstrip() != notes.rstrip():
+                  raise ValueError('已公开的同版本日志不一致，请使用新版本号')
+          PY
+            if [ "$(python -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["isDraft"]).lower())' "$RELEASE")" = false ]; then
+              EXISTING="$(mktemp -d)"
+              trap 'rm -rf "$EXISTING"' EXIT
+              gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir "$EXISTING" --pattern "$FILE" --pattern "$FILE.sha256"
+              if ! cmp -s "dist/$FILE" "$EXISTING/$FILE" || ! cmp -s "dist/$FILE.sha256" "$EXISTING/$FILE.sha256"; then
+                printf '%s\n' '::error::已公开的同版本包内容不同，拒绝覆盖，请使用新版本号'
+                exit 1
+              fi
+              printf '%s\n' '同一版本与附件已发布，无需重复上传'
+              exit 0
+            fi
+          else
+            if ! grep -qiE 'release not found|HTTP 404' "$RUNNER_TEMP/task-release-error"; then
+              python -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).read_text())' "$RUNNER_TEMP/task-release-error"
+              exit 1
+            fi
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft --latest=false --prerelease="$PRERELEASE" \
+              --title "定时任务插件 $TAG" --notes-file dist/release-notes.md
+          fi
+          for asset in "$FILE" "$FILE.sha256"; do
+            gh release upload "$TAG" "dist/$asset" -R "$GITHUB_REPOSITORY" --clobber
+          done
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets > "$RELEASE"
+          python - "$RELEASE" <<'PY'
+          import json, os, pathlib, sys
+          release = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+          if {asset['name'] for asset in release['assets']} != {os.environ['FILE'], os.environ['FILE'] + '.sha256'}:
+              raise ValueError('附件未齐或存在额外文件，Release 保持草稿')
+          PY
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest=false --prerelease="$PRERELEASE" \
+            --title "定时任务插件 $TAG" --notes-file dist/release-notes.md
+
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          path: builder
+          persist-credentials: false
+
+      - name: 登记到官网与 R2 存储
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLUGIN_PUBLISH_SECRET: ${{ secrets.PLUGIN_PUBLISH_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: python3 builder/.github/scripts/wasm_publish.py --register-tags "$TAG"

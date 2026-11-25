@@ -189,11 +189,11 @@ def register_tags(raw_tags, run_id):
     if not tags:
         raise ValueError('至少提供一个要登记的插件发布 tag')
     for tag in tags:
-        match = re.fullmatch(r'wasm-([a-z][a-z0-9-]*)-v(.+)', tag)
+        match = re.fullmatch(r'(wasm|task)-([a-z][a-z0-9-]*)-v(.+)', tag)
         if not match:
             raise ValueError(f'插件发布 tag 格式无效：{tag}')
-        provider, version = match.groups()
-        package = {'id': f'agent2api-wasm-{provider}', 'version': version, 'tag': tag}
+        kind, slug, version = match.groups()
+        package = {'id': f'agent2api-{kind}-{slug}', 'version': version, 'tag': tag}
         release = api(f"repos/{BUILD_REPO}/releases/tags/{quote(tag, safe='')}")
         notify(package, release, run_id)
 
